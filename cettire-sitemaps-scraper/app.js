@@ -58,22 +58,56 @@ async function getCettireSitemaps() {
 
 const publishProductUrlFromSitemaps = async (sitemapDataArray) => {
     console.log('Publishing product URLs to Kafka ...');
-    await producer.connect();
-    for (const { url, data } of sitemapDataArray) {
-        const parser = new xml2js.Parser();
-        const result = await parser.parseStringPromise(data);
-        const urlset = result.urlset.url;
-        for (const url of urlset) {
-            const message = {
-                value: url.loc.toString() 
-            };
-             producer.send({
-                 topic: target_topic,
-                 messages: [message]
-             }).then(r => console.log(`Published: ${message.value}`));
+
+    try {
+        await producer.connect();
+        
+        const processSitemap = async ({ url, data }) => {
+            try {
+                const parser = new xml2js.Parser();
+                const result = await parser.parseStringPromise(data);
+                const urlset = result.urlset.url;
+
+                // Create an array of messages
+                const messages = urlset.map(url => ({ value: url.loc.toString() }));
+
+                // Send messages in batches
+                const batchSize = 100; // Adjust the batch size based on your performance testing
+                for (let i = 0; i < messages.length; i += batchSize) {
+                    const batch = messages.slice(i, i + batchSize);
+                    await producer.send({
+                        topic: target_topic,
+                        messages: batch
+                    });
+                }
+
+                console.log(`Published ${messages.length} URLs from sitemap: ${url}`);
+            } catch (parseError) {
+                console.error(`Error parsing sitemap for URL: ${url}`, parseError);
+            }
+        };
+
+        // Process all sitemaps concurrently with a limit
+        const concurrencyLimit = 10; // Adjust the concurrency limit based on your performance testing
+        const sitemapChunks = [];
+
+        for (let i = 0; i < sitemapDataArray.length; i += concurrencyLimit) {
+            sitemapChunks.push(sitemapDataArray.slice(i, i + concurrencyLimit));
+        }
+
+        for (const chunk of sitemapChunks) {
+            await Promise.all(chunk.map(processSitemap));
+        }
+
+    } catch (connectionError) {
+        console.error('Error connecting to Kafka', connectionError);
+    } finally {
+        try {
+            await producer.disconnect();
+        } catch (disconnectError) {
+            console.error('Error disconnecting from Kafka', disconnectError);
         }
     }
-    await producer.disconnect();
 };
 
 (async () => {
