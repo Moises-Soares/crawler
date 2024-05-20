@@ -1,110 +1,138 @@
 const { Kafka } = require('kafkajs');
 const puppeteer = require('puppeteer');
-require('dotenv').config();
+const { Semaphore } = require('async-mutex');
 
+// Kafka configuration
 const kafkaBroker = process.env.KAFKA_BROKER || 'localhost:29092';
 const sourceTopic = 'product-urls';
 const targetTopic = 'cettire-product';
 
-(async () => {
-    if (!process.env.CHROME_BIN) {
-        process.env.CHROME_BIN = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
-    }
+// Puppeteer executable path configuration
+if (!process.env.CHROME_BIN) {
+    console.warn('CHROME_BIN environment variable is not set. Using default path for Google Chrome.');
+    process.env.CHROME_BIN = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+}
 
-    const kafka = new Kafka({
-        clientId: 'my-app',
-        brokers: [kafkaBroker]
-    });
+// Initialize Kafka
+const kafka = new Kafka({
+    clientId: 'cettire-product-scraper',
+    brokers: [kafkaBroker]
+});
 
-    const consumer = kafka.consumer({ groupId: 'cettire-product-scraper-group' });
-    const producer = kafka.producer();
+const consumer = kafka.consumer({ groupId: 'cettire-product-scraper-group' });
+const producer = kafka.producer();
+const semaphore = new Semaphore(10); // Adjust the concurrency limit as needed
+let browser;
 
-    const consumeMessages = async () => {
+// Main function to run the consumer
+const run = async () => {
+    try {
+        await consumer.connect();
+        await producer.connect();
         await consumer.subscribe({ topic: sourceTopic, fromBeginning: true });
 
+        // Launch the browser once
+        browser = await puppeteer.launch({
+            headless: true,
+            executablePath: process.env.CHROME_BIN
+        });
+
         await consumer.run({
-            eachMessage: async ({ topic, partition, message }) => {
-                const url = message.value.toString();
-                console.log(`Consumed message with Url: ${url}`);
-                if (url) {
-                    try {
-                        await scrap(url, producer, targetTopic);
-                    } catch (error) {
-                        console.error(`Error in scraping: ${error}`);
-                    }
-                }
+            eachBatch: async ({ batch }) => {
+                const promises = batch.messages.map(message => handleMessage(message));
+                await Promise.all(promises);
             }
         });
-    };
 
-    await consumer.connect();
-    await producer.connect();
-    await consumeMessages();
+        process.on('SIGINT', async () => {
+            console.log('Caught interrupt signal, shutting down...');
+            await consumer.disconnect();
+            await producer.disconnect();
+            if (browser) {
+                await browser.close();
+            }
+            process.exit(0);
+        });
+    } catch (error) {
+        console.error('Error in Kafka consumer/producer setup:', error.message);
+        process.exit(1);
+    }
+};
 
-    process.on('SIGINT', async () => {
-        console.log('Disconnecting consumer and producer...');
-        await consumer.disconnect();
-        await producer.disconnect();
-        process.exit();
-    });
-})();
+// Function to handle each message
+const handleMessage = async (message) => {
+    const url = message.value.toString();
+    console.log(`Consumed message with URL: ${url}`);
 
-const scrap = async (url, producer, topic) => {
-    if (!url.includes('products')) {
-        console.log('Not a product URL - skipping scraping for: ' + url);
+    if (!url || !url.includes('products')) {
+        console.log('Not a product URL or empty URL - skipping scraping');
         return;
     }
 
-    const executablePath = process.env.CHROME_BIN;
+    await semaphore.runExclusive(() => scrape(url));
+};
 
-    const browser = await puppeteer.launch({
-        headless: true,
-        executablePath: executablePath
-    });
+// Function to scrape the product data
+const scrape = async (url) => {
+    let page;
+    try {
+        page = await browser.newPage();
+        await setupInterception(page);
 
-    const page = await browser.newPage();
+        await page.goto(url, { waitUntil: 'networkidle2', timeout: 60000 });
 
+        // Replace page.waitForTimeout with a manual timeout
+        await new Promise(resolve => setTimeout(resolve, 5000)); // Wait to ensure all requests and responses are captured
+    } catch (error) {
+        console.error(`Error scraping URL ${url}:`, error.message);
+    } finally {
+        if (page) {
+            await page.close();
+        }
+    }
+};
+
+// Function to set up request and response interception
+const setupInterception = async (page) => {
     await page.setRequestInterception(true);
-
     page.on('request', (request) => {
-        if (request.resourceType() === 'image' || request.resourceType() === 'font') {
+        if (['image', 'font'].includes(request.resourceType())) {
             request.abort();
         } else {
+            if (request.url().includes('https://api.cettire.com/graphql')) {
+                //console.log('Intercepted GraphQL request:');
+            }
             request.continue();
         }
     });
 
     page.on('response', async (response) => {
-        if (response.url().includes('https://api.cettire.com/graphql') && response.ok()) {
-            try {
-                const contentType = response.headers()['content-type'];
-                if (contentType && contentType.includes('application/json')) {
-                    const jsonResponse = await response.json();
-                    if (jsonResponse.data.catalogItemProduct) {
-                        const product = jsonResponse.data.catalogItemProduct.product;
-                        console.log('Publishing product...');
-                        await producer.send({
-                            topic: topic,
-                            messages: [
-                                { value: JSON.stringify(product) }
-                            ]
-                        });
-                    } else {
-                        console.log('No product data found in response');
-                    }
-                } else {
-                    console.log('Not a JSON response');
-                }
-            } catch (ex) {
-                console.error('Error reading response: ' + ex.message);
+        if (!response.url().includes('https://api.cettire.com/graphql') || !response.ok()) return;
+
+        try {
+            const contentType = response.headers()['content-type'];
+            if (!contentType || !contentType.includes('application/json')) {
+                console.log('Not a JSON response');
+                return;
             }
+
+            const jsonResponse = await response.json();
+            if (!jsonResponse.data || !jsonResponse.data.catalogItemProduct) {
+                console.log('No product data found in response');
+                return;
+            }
+
+            const product = jsonResponse.data.catalogItemProduct.product;
+            console.log('Publishing product...');
+            await producer.send({
+                topic: targetTopic,
+                messages: [{ value: JSON.stringify(product) }]
+            });
+        } catch (ex) {
+            console.error('Error reading response:', ex.message);
         }
     });
-
-    await page.goto(url);
-
-    // Wait a bit to ensure all requests and responses are captured before closing the browser
-    await page.waitForTimeout(5000);
-
-    await browser.close();
 };
+
+// Start the consumer
+run().catch(console.error);
